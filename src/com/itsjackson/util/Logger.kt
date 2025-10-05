@@ -1,4 +1,4 @@
-package util
+package com.itsjackson.util
 
 import org.rspeer.commons.logging.Log
 

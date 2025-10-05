@@ -1,4 +1,4 @@
-package framework
+package com.itsjackson.framework
 
 import org.rspeer.game.script.Task
 

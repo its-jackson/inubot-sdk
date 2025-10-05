@@ -1,6 +1,6 @@
-package framework
+package com.itsjackson.framework
 
-import util.Logger
+import com.itsjackson.util.Logger
 import org.rspeer.game.Game
 import org.rspeer.game.adapter.scene.Npc
 import org.rspeer.game.adapter.scene.SceneObject
