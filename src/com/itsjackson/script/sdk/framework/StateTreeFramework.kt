@@ -1,9 +1,11 @@
-package com.itsjackson.framework
+package com.itsjackson.script.sdk.framework
 
-import com.itsjackson.util.Logger
-import org.rspeer.game.Game
+import com.itsjackson.script.sdk.util.GameTick
+import com.itsjackson.script.sdk.util.Logger
+import org.rspeer.commons.logging.Log
 import org.rspeer.game.adapter.scene.Npc
 import org.rspeer.game.adapter.scene.SceneObject
+import org.rspeer.game.script.Task
 
 sealed interface IStateTreeData
 
@@ -116,6 +118,8 @@ enum class TaskStatus {
 
 interface ITask<T : IContextProvider, S : IServiceProvider, C : IConfigurationProvider> {
     val name: String
+    var wait: CombinedWait<T, S, C>?
+    var lastStatus: TaskStatus
     var lastTickExecution: Int
     var interrupted: Boolean
 
@@ -130,22 +134,29 @@ internal class TaskManager<T : IContextProvider, S : IServiceProvider, C : IConf
         tasks: Array<ITask<T, S, C>>,
         combined: Combined<T, S, C>
     ): TaskStatus {
-        var status = TaskStatus.FAILURE
+        val gameTick = GameTick.now()
+        var lastStatus = TaskStatus.RUNNING
 
         for (task in tasks) {
+            if (lastStatus == TaskStatus.FAILURE) {
+                break
+            }
+
             if (task.interrupted) {
                 continue
             }
 
-            val gameTick = Game.getServerTick()
+            if (task.lastStatus == TaskStatus.SUCCESS) {
+                continue
+            }
+
+            // Continue running
+            lastStatus = task.execute(combined)
             task.lastTickExecution = gameTick
-
-            status = task.execute(combined)
+            task.lastStatus = lastStatus
         }
-
         resetTaskInterruptions(tasks)
-
-        return status // Return the last task executed status
+        return lastStatus
     }
 
     fun interruptTasks(tasks: Array<ITask<T, S, C>>) {
@@ -221,6 +232,89 @@ enum class LogicalOperation {
     }
 }
 
+internal class Wait(
+    private val maxTicks: Int,
+    private val conditions: List<() -> Boolean>,
+    private val onTimeout: (() -> Unit)? = null,
+    private val onComplete: (() -> Unit)? = null
+) {
+    private var startTick: Int = -1
+    private var active = false
+    private var completed = false
+    private var timedOut = false
+
+    fun start(currentTick: Int) {
+        startTick = currentTick
+        active = true
+        completed = false
+        timedOut = false
+    }
+
+    fun reset() {
+        startTick = -1
+        active = false
+        completed = false
+        timedOut = false
+    }
+
+    fun isActive(): Boolean = active
+    fun hasCompleted(): Boolean = completed
+    fun hasTimedOut(): Boolean = timedOut
+
+    fun check(currentTick: Int): Boolean {
+        if (!active) {
+            return false
+        }
+
+        val elapsed = currentTick - startTick
+        val timeout = elapsed >= maxTicks
+
+        val done = conditions.any { it() }
+
+        if (done || timeout) {
+            active = false
+            completed = done
+            timedOut = timeout
+
+            if (done) {
+                onComplete?.invoke()
+            }
+            if (timeout) {
+                onTimeout?.invoke()
+            }
+        }
+
+        // Return true while still waiting
+        return !done && !timeout
+    }
+}
+
+class CombinedWait<T : IContextProvider, S : IServiceProvider, C : IConfigurationProvider>(
+    private val maxTicks: Int,
+    private val conditions: List<(Combined<T, S, C>) -> Boolean>,
+    private val onTimeout: ((Combined<T, S, C>) -> Unit)? = null,
+    private val onComplete: ((Combined<T, S, C>) -> Unit)? = null
+) {
+    private var wait: Wait? = null
+
+    fun start(currentTick: Int, combined: Combined<T, S, C>) {
+        wait = Wait(
+            maxTicks,
+            conditions.map { { it(combined) } },
+            { onTimeout?.invoke(combined) },
+            { onComplete?.invoke(combined) }
+        ).apply {
+            start(currentTick)
+        }
+    }
+
+    fun check(currentTick: Int): Boolean = wait?.check(currentTick) ?: false
+    fun isActive(): Boolean = wait?.isActive() ?: false
+    fun hasCompleted(): Boolean = wait?.hasCompleted() ?: false
+    fun hasTimedOut(): Boolean = wait?.hasTimedOut() ?: false
+    fun reset() = wait?.reset()
+}
+
 class StateTree<T : IContextProvider, S : IServiceProvider, C : IConfigurationProvider> internal constructor(
     private val root: IState<T, S, C>,
     private val globalTasks: Array<ITask<T, S, C>>,
@@ -283,6 +377,18 @@ class StateTree<T : IContextProvider, S : IServiceProvider, C : IConfigurationPr
         // Evaluate current state and its children for any transition
         val nextState = evaluateStateTransitions(currentState, combined)
         if (nextState !== currentState) {
+            currentState.tasks.forEach {
+                it.interrupted = false
+                it.lastStatus = TaskStatus.RUNNING
+                it.wait?.reset()
+            }
+
+            globalTasks.forEach {
+                it.interrupted = false
+                it.lastStatus = TaskStatus.RUNNING
+                it.wait?.reset()
+            }
+
             exitState(currentState, combined)
             currentState = nextState ?: root
             enterState(currentState, combined)
@@ -384,17 +490,13 @@ class StateTreeBuilder<T : IContextProvider, S : IServiceProvider, C : IConfigur
         context: T,
         service: S,
         config: C,
-        init: ContextData<T, S, C>.() -> Unit
+        init: ContextData<T, S, C>.() -> Unit = { }
     ) {
         contextData = ContextData(context, service, config).apply(init)
     }
 
-    fun globalTask(name: String = "", action: (Combined<T, S, C>, ITask<T, S, C>) -> TaskStatus) {
-        globalTasks.add(buildTask(name, action))
-    }
-
-    fun globalTasks(init: TaskListBuilder<T, S, C>.() -> Unit) {
-        globalTasks.addAll(TaskListBuilder<T, S, C>().apply(init).build())
+    fun globalTask(init: TaskBuilder<T, S, C>.() -> Unit) {
+        globalTasks.add(TaskBuilder<T, S, C>().apply(init).build())
     }
 
     fun globalEvaluator(init: EvaluatorBuilder<T, S, C>.() -> Unit) {
@@ -409,7 +511,7 @@ class StateTreeBuilder<T : IContextProvider, S : IServiceProvider, C : IConfigur
         return StateTree(
             root ?: throw IllegalStateException("Root state must be defined"),
             globalTasks.toTypedArray(),
-            parameters ?: throw IllegalStateException("Parameters must be defined"),
+            parameters ?: StateTreeParameters(),
             contextData ?: throw IllegalStateException("Context must must be defined"),
             evaluators.toTypedArray(),
             globalTransitions.toTypedArray()
@@ -452,29 +554,8 @@ class StateBuilder<T : IContextProvider, S : IServiceProvider, C : IConfiguratio
         enterConditions.add(buildEnterCondition(operation, conditions))
     }
 
-    fun task(name: String = "", action: (Combined<T, S, C>, ITask<T, S, C>) -> TaskStatus) {
-        tasks.add(buildTask(name, action))
-    }
-
-    fun task(name: String = "", action: () -> TaskStatus) {
-        tasks.add(
-            buildTask(name) { combined, task ->
-                action.invoke()
-            }
-        )
-    }
-
-    fun taskRunning(name: String = "", action: () -> Unit) {
-        tasks.add(
-            buildTask(name) { combined, task ->
-                action.invoke()
-                TaskStatus.RUNNING
-            }
-        )
-    }
-
-    fun tasks(init: TaskListBuilder<T, S, C>.() -> Unit) {
-        tasks.addAll(TaskListBuilder<T, S, C>().apply(init).build())
+    fun task(init: TaskBuilder<T, S, C>.() -> Unit) {
+        tasks.add(TaskBuilder<T, S, C>().apply(init).build())
     }
 
     fun transitionWhen(init: TransitionBuilder<T, S, C>.() -> Unit) {
@@ -519,18 +600,90 @@ class StateBuilder<T : IContextProvider, S : IServiceProvider, C : IConfiguratio
 }
 
 @StateTreeDsl
-class TaskListBuilder<T : IContextProvider, S : IServiceProvider, C : IConfigurationProvider> {
-    private val tasks = mutableListOf<ITask<T, S, C>>()
+class WaitBuilder<T : IContextProvider, S : IServiceProvider, C : IConfigurationProvider> {
+    var maxTicks: Int = 0
 
-    fun task(name: String = "", action: (Combined<T, S, C>, ITask<T, S, C>) -> TaskStatus) {
-        tasks.add(buildTask(name, action))
+    private val conditions = mutableListOf<(Combined<T, S, C>) -> Boolean>()
+    private var onTimeout: ((Combined<T, S, C>) -> Unit)? = null
+    private var onComplete: ((Combined<T, S, C>) -> Unit)? = null
+
+    fun maxTicks(ticks: Int) {
+        maxTicks = ticks
     }
 
-    operator fun String.invoke(action: (Combined<T, S, C>, ITask<T, S, C>) -> TaskStatus) {
-        task(this, action)
+    fun until(predicate: (Combined<T, S, C>) -> Boolean) {
+        conditions.add(predicate)
     }
 
-    fun build(): List<ITask<T, S, C>> = tasks
+    fun onTimeout(block: (Combined<T, S, C>) -> Unit) {
+        onTimeout = block
+    }
+
+    fun onComplete(block: (Combined<T, S, C>) -> Unit) {
+        onComplete = block
+    }
+
+    fun build(): CombinedWait<T, S, C> {
+        return CombinedWait(maxTicks, conditions.toList(), onTimeout, onComplete)
+    }
+}
+
+@StateTreeDsl
+class TaskBuilder<T : IContextProvider, S : IServiceProvider, C : IConfigurationProvider> {
+    private var name: String = ""
+    private var actionFunc: (Combined<T, S, C>) -> Boolean? = { null }
+    private var wait: CombinedWait<T, S, C>? = null
+
+    fun name(name: String) {
+        this.name = name
+    }
+
+    fun action(block: (Combined<T, S, C>) -> Boolean?) {
+        this.actionFunc = block
+    }
+
+    fun wait(block: WaitBuilder<T, S, C>.() -> Unit) {
+        this.wait = WaitBuilder<T, S, C>().apply(block).build()
+    }
+
+    fun build(): ITask<T, S, C> {
+        return buildTask(name, wait) { combined, _ ->
+            val wait = wait ?: return@buildTask if (actionFunc(combined) == true) TaskStatus.SUCCESS else TaskStatus.FAILURE
+            val now = GameTick.now()
+
+            // If we're already waiting
+            if (wait.isActive()) {
+                Log.info("Waiting active: ($name)")
+
+                if (wait.check(now)) {
+                    return@buildTask TaskStatus.RUNNING
+                }
+
+                // Wait completed or timed out
+                return@buildTask when {
+                    wait.hasCompleted() -> {
+                        wait.reset()
+                        TaskStatus.SUCCESS
+                    }
+
+                    wait.hasTimedOut() -> {
+                        wait.reset()
+                        TaskStatus.FAILURE
+                    }
+
+                    else -> TaskStatus.RUNNING
+                }
+            }
+
+            // If not waiting yet, perform the action
+            if (actionFunc(combined) == true) {
+                wait.start(now, combined)
+                TaskStatus.RUNNING
+            } else {
+                TaskStatus.FAILURE
+            }
+        }
+    }
 }
 
 @StateTreeDsl
@@ -619,10 +772,13 @@ fun <T : IContextProvider, S : IServiceProvider, C : IConfigurationProvider> eva
 
 internal fun <T : IContextProvider, S : IServiceProvider, C : IConfigurationProvider> buildTask(
     name: String = "",
+    wait: CombinedWait<T, S ,C>? = null,
     executeFunc: (Combined<T, S, C>, ITask<T, S, C>) -> TaskStatus
 ): ITask<T, S, C> {
     return object : ITask<T, S, C> {
         override val name: String = name
+        override var wait: CombinedWait<T, S, C>? = wait
+        override var lastStatus: TaskStatus = TaskStatus.RUNNING
         override var lastTickExecution: Int = 0
         override var interrupted: Boolean = false
 

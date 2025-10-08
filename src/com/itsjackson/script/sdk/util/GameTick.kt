@@ -1,4 +1,4 @@
-package com.itsjackson.util
+package com.itsjackson.script.sdk.util
 
 import org.rspeer.game.Game
 

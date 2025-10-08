@@ -1,13 +1,18 @@
-package com.itsjackson.framework
+package com.itsjackson.script.sdk.framework
 
 import org.rspeer.game.script.Task
+import org.rspeer.game.script.TaskDescriptor
 
 abstract class StateTreeRoutineTask<T : IContextProvider, S : IServiceProvider, C : IConfigurationProvider>(
     protected val contextProvider: T,
     protected val serviceProvider: S,
     protected val configProvider: C
 ) : Task() {
+    protected val manifest = this::class.java.getAnnotation(TaskDescriptor::class.java)
+
     private var started = false
+
+    var running = false
 
     private val stateTree: StateTree<T, S, C> by lazy {
         buildTree()
@@ -25,7 +30,9 @@ abstract class StateTreeRoutineTask<T : IContextProvider, S : IServiceProvider, 
             initialize()
             stateTree.start()
         }
-
+        if (!running) {
+            return false
+        }
         return when (stateTree.tick()) {
             TaskStatus.RUNNING -> {
                 onTaskRunning()
